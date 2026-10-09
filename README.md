@@ -843,9 +843,10 @@ not been built:
   technical one.
 - **Multi-asset vaults** — one SEP-41 asset per vault today.
 - **Beneficiary consent (accept/decline)** and **renunciation**.
-- **`get_vaults_by_beneficiary`** — requires a second append-only index; it was
-  left out rather than added speculatively, to avoid extra writes on the hot
-  deposit/claim paths.
+- **`get_vaults_by_beneficiary`** — implemented; see the beneficiary-side
+  append-only index in `storage.rs` and the `get_vaults_by_beneficiary` ABI
+  entry point. The index is written once per new beneficiary enrollment (not
+  per reactivation), so the hot deposit/claim paths are unaffected.
 - **Keeper bounties** — paying whoever calls `activate_vault`. Would need a
   careful design so it cannot be gamed to drain a vault.
 - **An on-chain audit trail of status transitions** — events cover it off-chain,

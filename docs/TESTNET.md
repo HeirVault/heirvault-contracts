@@ -221,6 +221,9 @@ were not repeated as live Testnet transactions:
 - `MultiCondition` activation mode (the other two modes were exercised; this is
   the conjunction of both and is covered by two unit tests)
 - `remove_beneficiary` / `update_beneficiary` and the guardian removal paths
+- `get_vaults_by_beneficiary` is now implemented; its paging is covered by the
+  unit test `a_beneficiary_can_list_every_vault_it_is_enrolled_in` and it is
+  reachable against the deployed contract using the invocations in the README.
 - `get_beneficiaries`, `get_guardians` and `get_claims` paging
 - the `InvalidPeriod` / `DuplicateBeneficiary` / `TooManyBeneficiaries` rejection
   paths
