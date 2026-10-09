@@ -471,6 +471,15 @@ pub struct ClaimPage {
     pub meta: PageMeta,
 }
 
+/// One page of vault ids in which a beneficiary is or was enrolled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiaryVaultPage {
+    /// Vault ids, newest first by the beneficiary index's insertion order.
+    pub vault_ids: Vec<u64>,
+    pub meta: PageMeta,
+}
+
 /// Live guardian-approval position for one vault.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

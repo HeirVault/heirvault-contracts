@@ -92,6 +92,16 @@ pub enum DataKey {
     OwnerVaultCount(Address),
     /// Slot `index` of an owner's vault list, holding a vault id. Persistent storage.
     OwnerVault(Address, u32),
+    /// Number of vaults in which a beneficiary is or was enrolled. Persistent
+    /// storage.
+    BeneficiaryVaultCount(Address),
+
+    /// Slot `index` of a beneficiary's vault list, holding a vault id. Persistent
+    /// storage. Parallel append-only index to `OwnerVault`, keyed by the
+    /// beneficiary address. Present so an heir or an indexer can enumerate every
+    /// vault in which a given address is a beneficiary without scanning all
+    /// vaults.
+    BeneficiaryVault(Address, u32),
 }
 
 /// Refresh the instance entry's TTL.
@@ -103,6 +113,66 @@ pub fn touch_instance(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
+// ---------------------------------------------------------------------------
+// Beneficiary vault index
+// ---------------------------------------------------------------------------
+
+/// Append `vault_id` to a beneficiary's vault list.
+///
+/// Called by `add_beneficiary` when a new slot is created. The index is
+/// append-only: removing or deactivating a beneficiary never removes slots, so
+/// offsets are stable across calls and a beneficiary page cannot shrink
+/// underneath a client.
+///
+/// Slots are 0-indexed, matching the owner-side index (`push_owner_vault`): the
+/// first slot lands at index 0, the count is then bumped to 1, and a page read
+/// starting at offset 0 finds the first slot immediately.
+pub fn append_beneficiary_vault(env: &Env, beneficiary: &Address, vault_id: u64) {
+    let index = beneficiary_vault_count(env, beneficiary);
+
+    let count_key = DataKey::BeneficiaryVaultCount(beneficiary.clone());
+    let new_count = index
+        .checked_add(1)
+        .expect("beneficiary vault index must not overflow u32");
+    env.storage()
+        .persistent()
+        .set(&count_key, &new_count);
+    env.storage()
+        .persistent()
+        .extend_ttl(
+            &count_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+    let slot_key = DataKey::BeneficiaryVault(beneficiary.clone(), index);
+    env.storage()
+        .persistent()
+        .set(&slot_key, &vault_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(
+            &slot_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+}
+
+/// Number of vaults in which `beneficiary` is or was a beneficiary.
+pub fn beneficiary_vault_count(env: &Env, beneficiary: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BeneficiaryVaultCount(beneficiary.clone()))
+        .unwrap_or(0)
+}
+
+/// Vault id at slot `index` of a beneficiary's vault list, or `None`.
+pub fn beneficiary_vault_id_at(env: &Env, beneficiary: &Address, index: u32) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BeneficiaryVault(beneficiary.clone(), index))
 }
 
 // ---------------------------------------------------------------------------

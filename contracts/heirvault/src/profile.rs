@@ -350,10 +350,14 @@ fn profile_entry_points() {
     // ledger entries: at most the instance entry's TTL bump plus the vault
     // record itself. This is the property that keeps configuration changes cheap
     // no matter how many vaults exist.
+    //
+    // `add_beneficiary` additionally writes the new beneficiary-side index slot
+    // and its count entry (2 more writes), because that index is what powers
+    // `get_vaults_by_beneficiary`. That index is append-only and keyed by
+    // beneficiary, so the write cost is the same for the first beneficiary as
+    // for the tenth — see the invariant below.
     for label in [
         "check_in",
-        "add_beneficiary (1st)",
-        "add_beneficiary (10th)",
         "update_beneficiary",
         "remove_beneficiary",
         "set_guardian_threshold",
@@ -367,6 +371,15 @@ fn profile_entry_points() {
             row.write_entries <= 2,
             "{label} wrote {} ledger entries; a token-free mutator should write at most 2 \
              (the instance entry's TTL bump plus the vault record)",
+            row.write_entries
+        );
+    }
+    for label in ["add_beneficiary (1st)", "add_beneficiary (10th)"] {
+        let row = find(label);
+        assert!(
+            row.write_entries <= 4,
+            "{label} wrote {} ledger entries; should be at most 4 (instance TTL + vault record + \
+             beneficiary-index slot + beneficiary-index count)",
             row.write_entries
         );
     }

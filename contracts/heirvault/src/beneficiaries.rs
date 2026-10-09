@@ -96,16 +96,16 @@ pub fn add(
 
     match existing {
         // Reactivate the retained slot so the address appears exactly once.
-        Some(index) => {
+        Some(_index) => {
             let mut slot = vault
                 .beneficiaries
-                .get(index)
+                .get(existing.unwrap())
                 .ok_or(HeirVaultError::InvalidBeneficiary)?;
             slot.active = true;
             slot.allocation_bps = allocation_bps;
             slot.claimed = false;
             slot.claimed_amount = 0;
-            vault.beneficiaries.set(index, slot);
+            vault.beneficiaries.set(existing.unwrap(), slot);
         }
         None => {
             vault.beneficiaries.push_back(Beneficiary {
@@ -115,6 +115,9 @@ pub fn add(
                 claimed: false,
                 claimed_amount: 0,
             });
+            // Every distinct address enrolled in a vault is recorded in the
+            // beneficiary-side index, even if the slot is later deactivated.
+            storage::append_beneficiary_vault(env, &beneficiary, vault_id);
         }
     }
 

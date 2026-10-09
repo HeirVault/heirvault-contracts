@@ -349,6 +349,16 @@ impl HeirVaultContract {
         storage::vault_count(&env)
     }
 
+    /// One page of vault ids in which a beneficiary is or was enrolled.
+    pub fn get_vaults_by_beneficiary(
+        env: Env,
+        beneficiary: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<types::BeneficiaryVaultPage, HeirVaultError> {
+        vault::get_by_beneficiary(&env, beneficiary, offset, limit)
+    }
+
     /// The schema version of the running contract code.
     ///
     /// Compare against a vault's own `schema_version` to detect a record written

@@ -566,3 +566,42 @@ pub fn get_by_owner(
     let meta = storage::page_meta(total, offset, limit, items.len());
     Ok(VaultPage { items, meta })
 }
+
+/// One page of vault ids in which a beneficiary is or was enrolled.
+///
+/// Costs `limit` point reads through the beneficiary index, so the price does
+/// not grow with the total number of vaults in the contract.
+///
+/// Unlike `get_vaults_by_owner`, this page returns vault ids only: a beneficiary
+/// usually does not have permission to read other owners' vault records, and the
+/// index is sized to let an heir enumerate the vaults it cares about without a
+/// full scan.
+pub fn get_by_beneficiary(
+    env: &Env,
+    beneficiary: Address,
+    offset: u32,
+    limit: u32,
+) -> Result<crate::types::BeneficiaryVaultPage, HeirVaultError> {
+    let limit = storage::clamp_limit(limit)?;
+    let total = storage::beneficiary_vault_count(env, &beneficiary);
+
+    let mut vault_ids = Vec::new(env);
+    let mut cursor = offset;
+    while cursor < total && vault_ids.len() < limit {
+        if let Some(id) = storage::beneficiary_vault_id_at(env, &beneficiary, cursor) {
+            // A slot whose vault is unreadable is skipped rather than failing the
+            // page: one archived entry must not make the beneficiary's other
+            // vaults unlistable.
+            if storage::has_vault(env, id) {
+                vault_ids.push_back(id);
+            }
+        }
+        cursor += 1;
+    }
+
+    let meta = storage::page_meta(total, offset, limit, vault_ids.len());
+    Ok(crate::types::BeneficiaryVaultPage {
+        vault_ids,
+        meta,
+    })
+}

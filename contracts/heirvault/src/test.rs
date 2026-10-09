@@ -2376,6 +2376,85 @@ fn beneficiaries_guardians_and_claims_page_independently() {
     assert_eq!(c_page.items.get(0).unwrap().entitlement, 20 * UNIT);
     assert!(!c_page.items.get(0).unwrap().claimed);
     assert!(c_page.meta.has_more);
+
+    // The beneficiary-side index records one vault per enrollment. The first
+    // beneficiary was added once, so its index has exactly one entry.
+    let first = client.get_beneficiaries(&id, &0, &1).items.first().unwrap();
+    let bv = client.get_vaults_by_beneficiary(&first.address, &0, &5);
+    assert_eq!(bv.vault_ids.len(), 1);
+    assert_eq!(bv.vault_ids.get(0).unwrap(), id);
+    assert_eq!(bv.meta.total, 1);
+    assert!(!bv.meta.has_more);
+    assert_eq!(bv.meta.next_offset, None);
+}
+
+/// A beneficiary can enumerate every vault in which it is or was enrolled.
+///
+/// The beneficiary index is append-only and keyed by beneficiary, which is what
+/// makes this call cheap and what lets an heir list its vaults without a full
+/// contract scan.
+#[test]
+fn a_beneficiary_can_list_every_vault_it_is_enrolled_in() {
+    let env = Env::default();
+    let (_, asset, owner, client) = world(&env);
+    let heir = Address::generate(&env);
+
+    let id_a = client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+    let id_b = client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+
+    // Heir enrolled in vault A only.
+    client.add_beneficiary(&id_a, &heir, &10_000u32);
+
+    // Heir enrolled in vault B as a 50% heir alongside another heir.
+    let other = Address::generate(&env);
+    client.add_beneficiary(&id_b, &heir, &5_000u32);
+    client.add_beneficiary(&id_b, &other, &5_000u32);
+
+    // Remove heir from B, then re-add it: the slot is retained and reactivated,
+    // but re-activation does not append a new index entry — the index records one
+    // entry per vault per beneficiary, not per enrollment event.
+    client.remove_beneficiary(&id_b, &heir);
+    client.add_beneficiary(&id_b, &heir, &5_000u32);
+
+    let page = client.get_vaults_by_beneficiary(&heir, &0, &5);
+    assert_eq!(page.vault_ids.len(), 2, "both vaults are listed once each");
+    assert_eq!(page.meta.total, 2, "one index entry per vault");
+    assert!(!page.meta.has_more);
+    assert_eq!(page.meta.next_offset, None);
+
+    // Pages are stable and non-overlapping.
+    let mut seen = StdVec::new();
+    for offset in [0u32, 2] {
+        for id in client
+            .get_vaults_by_beneficiary(&heir, &offset, &2)
+            .vault_ids
+            .iter()
+        {
+            seen.push(id);
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, std::vec![id_a, id_b]);
+
+    // A beneficiary with no enrollments gets an empty page but a valid meta.
+    let lone = Address::generate(&env);
+    let empty = client.get_vaults_by_beneficiary(&lone, &0, &5);
+    assert_eq!(empty.vault_ids.len(), 0);
+    assert_eq!(empty.meta.total, 0);
+    assert!(!empty.meta.has_more);
+    assert_eq!(empty.meta.next_offset, None);
 }
 
 // ---------------------------------------------------------------------------
