@@ -20,10 +20,13 @@ extern crate std;
 use std::vec::Vec as StdVec;
 
 use soroban_sdk::testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke};
-use soroban_sdk::{token, Address, Env, IntoVal, Symbol, TryFromVal, Val, Vec};
+use soroban_sdk::{
+    symbol_short, token, Address, Env, IntoVal, InvokeError, Symbol, TryFromVal, Val, Vec,
+};
 
 use crate::{
-    ActivationMode, HeirVaultContract, HeirVaultContractClient, HeirVaultError, VaultStatus,
+    ActivationMode, HeirVaultContract, HeirVaultContractClient, HeirVaultError, VaultInfo,
+    VaultStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,6 +172,201 @@ macro_rules! capture {
         let value = $call;
         (value, drain_events($env))
     }};
+}
+
+// ---------------------------------------------------------------------------
+// Transaction-failure harness: a token whose `transfer` can be made to panic.
+// ---------------------------------------------------------------------------
+
+/// A minimal SEP-41-shaped token that can be switched into a mode where every
+/// `transfer` traps.
+///
+/// It exists to prove the checks -> effects -> interactions ordering is real and
+/// not just documented: when the inner transfer fails, the vault's already
+/// written state (the `claimed` flag, the decremented balance, `total_claimed`)
+/// must roll back with it, so a failed claim leaves the heir able to retry and
+/// never able to be paid twice.
+#[soroban_sdk::contract]
+pub struct FailingToken;
+
+#[soroban_sdk::contractimpl]
+impl FailingToken {
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+
+    pub fn set_failing(env: Env, failing: bool) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("failing"), &failing);
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        let failing: bool = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("failing"))
+            .unwrap_or(false);
+        if failing {
+            panic!("FailingToken: transfer failed");
+        }
+    }
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+}
+
+/// A hostile token that tries to re-enter the vault from inside `transfer`.
+///
+/// When armed, each `transfer` disarms itself and then makes two call-backs
+/// into the vault:
+///
+/// * `get_vault` — read-only and unauthenticated, so *nothing in HeirVault*
+///   could legitimately reject it, and
+/// * `claim` for the beneficiary currently being paid — the state-changing call
+///   an attacker would actually want, and the one a missing re-entrancy guard
+///   would turn into a double payout.
+///
+/// Recording both outcomes separately is what makes the test evidence rather
+/// than an assertion: it distinguishes "the vault re-ran and its `claimed` flag
+/// saved us" from "the call never reached the vault again". It is the latter:
+/// Soroban runs contract-to-contract calls with
+/// `ContractReentryMode::Prohibited` (`soroban-env-host` 22.1.3,
+/// `src/host/frame.rs`), so a contract already on the call stack cannot be
+/// re-entered at all.
+///
+/// It lives in its own module because each `#[contract]` contributes a set of
+/// `__SPEC_XDR_*` symbols, and two contracts in one module would collide.
+pub mod reentrant_token {
+    use super::*;
+
+    /// The probe was never made.
+    pub const NOT_ATTEMPTED: i32 = 0;
+    /// The host refused the call (surfaces as `InvokeError::Abort`).
+    pub const HOST_REFUSED: i32 = 1;
+    /// The call ran and returned a value, i.e. re-entry succeeded.
+    pub const SUCCEEDED: i32 = 2;
+    /// The vault itself answered with a contract error.
+    pub const CONTRACT_ERROR: i32 = 3;
+    /// A host error other than a refusal to re-enter.
+    pub const OTHER_HOST_ERROR: i32 = 4;
+
+    #[soroban_sdk::contract]
+    pub struct ReentrantToken;
+
+    #[soroban_sdk::contractimpl]
+    impl ReentrantToken {
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+
+        pub fn arm(env: Env, vault_id: u64, vault: Address, beneficiary: Address) {
+            env.storage().instance().set(&symbol_short!("armed"), &true);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("vid"), &vault_id);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("vault"), &vault);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("ben"), &beneficiary);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("rdcode"), &NOT_ATTEMPTED);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("clcode"), &NOT_ATTEMPTED);
+        }
+
+        /// Outcome of the read-only `get_vault` call-back.
+        pub fn read_outcome(env: Env) -> i32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("rdcode"))
+                .unwrap_or(NOT_ATTEMPTED)
+        }
+
+        /// Outcome of the `claim` call-back.
+        pub fn claim_outcome(env: Env) -> i32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("clcode"))
+                .unwrap_or(NOT_ATTEMPTED)
+        }
+
+        pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+            let armed: bool = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("armed"))
+                .unwrap_or(false);
+            if !armed {
+                return;
+            }
+            // Disarm first so a nested call can never recurse further.
+            env.storage()
+                .instance()
+                .set(&symbol_short!("armed"), &false);
+
+            let vault_id: u64 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("vid"))
+                .unwrap_or(0);
+            let vault: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("vault"))
+                .unwrap_or_else(|| env.current_contract_address());
+            let beneficiary: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("ben"))
+                .unwrap_or_else(|| env.current_contract_address());
+
+            // Probe 1: a read-only entry point, which needs no authorization.
+            let mut read_args: Vec<Val> = Vec::new(&env);
+            read_args.push_back(vault_id.into_val(&env));
+            let read_code: i32 = match env.try_invoke_contract::<VaultInfo, HeirVaultError>(
+                &vault,
+                &Symbol::new(&env, "get_vault"),
+                read_args,
+            ) {
+                Ok(_) => SUCCEEDED,
+                Err(Ok(_)) => CONTRACT_ERROR,
+                Err(Err(InvokeError::Abort)) => HOST_REFUSED,
+                Err(Err(_)) => OTHER_HOST_ERROR,
+            };
+
+            // Probe 2: the state-changing call an attacker actually wants.
+            let mut claim_args: Vec<Val> = Vec::new(&env);
+            claim_args.push_back(vault_id.into_val(&env));
+            claim_args.push_back(beneficiary.to_val());
+            let claim_code: i32 = match env.try_invoke_contract::<i128, HeirVaultError>(
+                &vault,
+                &Symbol::new(&env, "claim"),
+                claim_args,
+            ) {
+                Ok(_) => SUCCEEDED,
+                Err(Ok(_)) => CONTRACT_ERROR,
+                Err(Err(InvokeError::Abort)) => HOST_REFUSED,
+                Err(Err(_)) => OTHER_HOST_ERROR,
+            };
+
+            env.storage()
+                .instance()
+                .set(&symbol_short!("rdcode"), &read_code);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("clcode"), &claim_code);
+        }
+
+        pub fn balance(_env: Env, _id: Address) -> i128 {
+            0
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1738,54 @@ fn rounding_dust_goes_to_the_last_heir_to_claim() {
     assert_eq!(client.get_vault(&id).vault.status, VaultStatus::Completed);
 }
 
+/// An heir whose floored share rounds below one unit is paid zero but is still
+/// marked claimed, so the vault can still reach `COMPLETED`.
+///
+/// Without that rule a vault whose balance is smaller than the inverse of an
+/// heir's share would stall forever: the heir's entitlement rounds to zero, and
+/// treating that as "not claimed" would leave `claimed_count` short of the
+/// beneficiary count and the vault permanently `ACTIVATED`.
+#[test]
+fn an_heir_whose_share_rounds_to_zero_is_still_marked_claimed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+    let (contract, asset) = deploy(&env);
+    let client = HeirVaultContractClient::new(&env, &contract);
+    let owner = Address::generate(&env);
+    let id = client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.add_beneficiary(&id, &a, &9_999u32);
+    client.add_beneficiary(&id, &b, &1u32);
+
+    // One base unit: floor(1 * 9999 / 10_000) == 0, so A's payout rounds to zero.
+    mint(&env, &asset, &owner, 1);
+    client.deposit(&id, &asset, &1);
+    advance(&env, CHECK_IN + GRACE);
+    client.activate_vault(&id);
+
+    assert_eq!(client.claim(&id, &a), 0, "A's share rounds below one unit");
+    let position = client.get_claim(&id, &a);
+    assert!(position.claimed, "a zero payout still settles the slot");
+    assert_eq!(position.claimed_amount, 0);
+
+    // B is last and absorbs the whole balance, so the vault drains to zero.
+    assert_eq!(client.claim(&id, &b), 1);
+    let info = client.get_vault(&id);
+    assert_eq!(info.vault.status, VaultStatus::Completed);
+    assert_eq!(info.vault.balance, 0);
+    assert_eq!(info.vault.total_claimed, 1);
+    assert_eq!(balance(&env, &asset, &contract), 0);
+}
+
 #[test]
 fn claim_order_does_not_change_the_total_distributed() {
     let env = Env::default();
@@ -1632,6 +1878,142 @@ fn unregistered_addresses_cannot_claim() {
         client.try_claim(&id, &stranger),
         HeirVaultError::InvalidBeneficiary
     );
+}
+
+/// A token transfer that fails must revert the claim's own state writes.
+///
+/// `claim` records the payout (sets `claimed`, decrements `balance`, bumps
+/// `total_claimed`) *before* it calls the token, so a hostile or simply broken
+/// token can never observe a half-applied claim, and a failed transfer leaves no
+/// residue: the slot is still unclaimed and the heir can retry.
+#[test]
+fn a_failed_token_transfer_reverts_every_claim_side_effect() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+
+    let token_addr = env.register(FailingToken, ());
+    let token = FailingTokenClient::new(&env, &token_addr);
+    let contract = env.register(HeirVaultContract, ());
+    let client = HeirVaultContractClient::new(&env, &contract);
+    let owner = Address::generate(&env);
+    let heir = Address::generate(&env);
+
+    let id = client.create_vault(
+        &owner,
+        &token_addr,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+    client.add_beneficiary(&id, &heir, &10_000u32);
+    client.deposit(&id, &token_addr, &(100 * UNIT));
+
+    advance(&env, CHECK_IN + GRACE);
+    client.activate_vault(&id);
+
+    // Make the token's transfer trap, then attempt the claim.
+    token.set_failing(&true);
+    assert!(
+        client.try_claim(&id, &heir).is_err(),
+        "a claim whose transfer fails must not report success"
+    );
+
+    // Every side effect of the aborted claim is rolled back with it.
+    let position = client.get_claim(&id, &heir);
+    assert!(
+        !position.claimed,
+        "the claimed flag must not survive a revert"
+    );
+    assert_eq!(position.claimed_amount, 0);
+    let info = client.get_vault(&id);
+    assert_eq!(
+        info.vault.balance,
+        100 * UNIT,
+        "the balance must be restored"
+    );
+    assert_eq!(info.vault.total_claimed, 0);
+    assert_eq!(info.vault.status, VaultStatus::Activated);
+
+    // A retry against a working token settles exactly, and only once.
+    token.set_failing(&false);
+    assert_eq!(client.claim(&id, &heir), 100 * UNIT);
+    assert_eq!(client.get_vault(&id).vault.status, VaultStatus::Completed);
+    assert_eq!(client.get_vault(&id).vault.balance, 0);
+    assert_contract_error!(client.try_claim(&id, &heir), HeirVaultError::VaultCompleted);
+}
+
+/// A hostile token that calls back into the vault from inside `transfer` must
+/// not be able to double-pay an heir or corrupt the vault's accounting.
+///
+/// This is the executable form of the re-entrancy question. HeirVault has no
+/// re-entrancy guard cell of its own, so the guarantee has to come from
+/// somewhere: this test uses a real hostile token, reports what happened to
+/// each call-back, and asserts both that the call-backs were refused and that
+/// the money and the state are exactly right afterwards.
+#[test]
+fn a_reentrant_token_cannot_call_back_into_the_vault_during_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(START);
+
+    let token_addr = env.register(reentrant_token::ReentrantToken, ());
+    let token = reentrant_token::ReentrantTokenClient::new(&env, &token_addr);
+    let contract = env.register(HeirVaultContract, ());
+    let client = HeirVaultContractClient::new(&env, &contract);
+    let owner = Address::generate(&env);
+    let heir = Address::generate(&env);
+
+    let id = client.create_vault(
+        &owner,
+        &token_addr,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+    client.add_beneficiary(&id, &heir, &10_000u32);
+    client.deposit(&id, &token_addr, &(100 * UNIT));
+
+    advance(&env, CHECK_IN + GRACE);
+    client.activate_vault(&id);
+
+    assert_eq!(token.read_outcome(), reentrant_token::NOT_ATTEMPTED);
+    assert_eq!(token.claim_outcome(), reentrant_token::NOT_ATTEMPTED);
+
+    // Arm the token so the payout's transfer calls back into the vault.
+    token.arm(&id, &contract, &heir);
+    let (paid, events) = capture!(&env, client.claim(&id, &heir));
+    assert_eq!(paid, 100 * UNIT);
+
+    // Both call-backs were attempted and both were refused. The read-only probe
+    // matters: it is unauthenticated and touches no state, so the only thing
+    // that can refuse it is the host's non-reentrancy rule, not a check inside
+    // HeirVault. (`SUCCEEDED` here would mean re-entry is possible at all.)
+    assert_eq!(
+        token.read_outcome(),
+        reentrant_token::HOST_REFUSED,
+        "a read-only call-back should be refused by the host"
+    );
+    assert_eq!(
+        token.claim_outcome(),
+        reentrant_token::HOST_REFUSED,
+        "a re-entrant claim must not reach the vault again"
+    );
+
+    // The heir was paid exactly once, and the vault's own accounting agrees.
+    let info = client.get_vault(&id);
+    assert_eq!(info.vault.status, VaultStatus::Completed);
+    assert_eq!(info.vault.total_claimed, 100 * UNIT);
+    assert_eq!(info.vault.balance, 0);
+    assert!(client.get_claim(&id, &heir).claimed);
+    assert_eq!(client.get_claim(&id, &heir).claimed_amount, 100 * UNIT);
+
+    // Exactly one payout event was emitted, so the token cannot have triggered a
+    // second, successful payout that the state assertions above happened to
+    // miss.
+    let paid_event = Symbol::new(&env, "inheritance_claimed");
+    let payouts = events.iter().filter(|name| **name == paid_event).count();
+    assert_eq!(payouts, 1, "the heir must be paid exactly once");
 }
 
 #[test]
@@ -2455,6 +2837,128 @@ fn a_beneficiary_can_list_every_vault_it_is_enrolled_in() {
     assert_eq!(empty.meta.total, 0);
     assert!(!empty.meta.has_more);
     assert_eq!(empty.meta.next_offset, None);
+}
+
+/// Paging must hand back a cursor that is past every slot it already inspected,
+/// including slots it skipped because their vault record was unreadable.
+///
+/// Soroban's persistent-storage API does not distinguish "never written" from
+/// "archived"; a page function therefore skips an unreadable slot rather than
+/// failing. Deriving `next_offset` from the number of records *returned* instead
+/// of from the scan cursor would make the page re-read the skipped slot, and if
+/// every slot in the window were unreadable the client's paging loop would never
+/// advance. This test simulates archival by deleting the index slot / vault
+/// record directly through the storage host API.
+#[test]
+fn paging_terminates_when_every_index_slot_is_unreadable() {
+    let env = Env::default();
+    let (contract, asset, owner, client) = world(&env);
+    client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+
+    // Archive the only vault record, leaving the owner index entry in place.
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .remove(&crate::storage::DataKey::Vault(1));
+    });
+
+    let page = client.get_vaults_by_owner(&owner, &0, &10);
+    assert_eq!(page.items.len(), 0, "the archived record is skipped");
+    assert_eq!(page.meta.total, 1, "the index still counts the slot");
+    assert!(
+        !page.meta.has_more,
+        "the scan consumed the only slot; the page must not loop"
+    );
+    assert_eq!(page.meta.next_offset, None);
+}
+
+/// A skipped slot must advance the reported cursor past itself, so a paging loop
+/// neither repeats nor omits records around the gap.
+#[test]
+fn paging_skips_an_unreadable_vault_without_repeating_a_record() {
+    let env = Env::default();
+    let (contract, asset, owner, client) = world(&env);
+    for _ in 0..3 {
+        client.create_vault(
+            &owner,
+            &asset,
+            &ActivationMode::MissedCheckIn,
+            &CHECK_IN,
+            &GRACE,
+        );
+    }
+
+    // Archive the middle vault (id 2).
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .remove(&crate::storage::DataKey::Vault(2));
+    });
+
+    let one_page = client.get_vaults_by_owner(&owner, &0, &10);
+    assert_eq!(one_page.items.len(), 2);
+    assert!(!one_page.meta.has_more);
+    assert_eq!(one_page.meta.next_offset, None);
+
+    // Walking one at a time must see every readable vault exactly once.
+    let mut seen = StdVec::new();
+    let mut cursor = 0u32;
+    for _ in 0..10 {
+        let page = client.get_vaults_by_owner(&owner, &cursor, &1);
+        for summary in page.items.iter() {
+            seen.push(summary.id);
+        }
+        match page.meta.next_offset {
+            Some(next) => cursor = next,
+            None => break,
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, std::vec![1, 3], "no record is repeated or lost");
+}
+
+/// The beneficiary-side index pages with the same skip-aware cursor.
+#[test]
+fn beneficiary_paging_skips_an_unreadable_vault() {
+    let env = Env::default();
+    let (contract, asset, owner, client) = world(&env);
+    let heir = Address::generate(&env);
+
+    let id_a = client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+    let id_b = client.create_vault(
+        &owner,
+        &asset,
+        &ActivationMode::MissedCheckIn,
+        &CHECK_IN,
+        &GRACE,
+    );
+    client.add_beneficiary(&id_a, &heir, &10_000u32);
+    client.add_beneficiary(&id_b, &heir, &10_000u32);
+
+    env.as_contract(&contract, || {
+        env.storage()
+            .persistent()
+            .remove(&crate::storage::DataKey::Vault(id_a));
+    });
+
+    let page = client.get_vaults_by_beneficiary(&heir, &0, &5);
+    assert_eq!(page.vault_ids.len(), 1);
+    assert_eq!(page.vault_ids.get(0).unwrap(), id_b);
+    assert_eq!(page.meta.total, 2);
+    assert!(!page.meta.has_more);
+    assert_eq!(page.meta.next_offset, None);
 }
 
 // ---------------------------------------------------------------------------

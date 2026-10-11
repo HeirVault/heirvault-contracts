@@ -38,10 +38,14 @@
 //! # Ordering: checks, then effects, then interactions
 //!
 //! Every value function here validates, then writes the new state, and only
-//! then calls into the token contract. A hostile or re-entrant token therefore
-//! observes the *post*-transfer accounting, and a failed transfer reverts the
-//! whole transaction including the accounting — so the internal balance can
-//! never drift from the tokens actually held.
+//! then calls into the token contract. A failed transfer therefore reverts the
+//! whole transaction including the accounting, so the internal balance can never
+//! drift from the tokens actually held.
+//!
+//! Writing state first is the second layer of the re-entrancy defence, not the
+//! first: the host runs contract-to-contract calls with re-entry prohibited, so
+//! a token that tried to call back in would not reach this code at all. Ordering
+//! is what covers the case where that does not hold.
 
 use soroban_sdk::{symbol_short, token, Address, Env, Vec};
 
@@ -563,7 +567,9 @@ pub fn get_by_owner(
         cursor += 1;
     }
 
-    let meta = storage::page_meta(total, offset, limit, items.len());
+    // `cursor`, not `items.len()`: slots skipped above are already consumed and
+    // the next page must start after them.
+    let meta = storage::page_meta(total, offset, limit, cursor);
     Ok(VaultPage { items, meta })
 }
 
@@ -599,9 +605,7 @@ pub fn get_by_beneficiary(
         cursor += 1;
     }
 
-    let meta = storage::page_meta(total, offset, limit, vault_ids.len());
-    Ok(crate::types::BeneficiaryVaultPage {
-        vault_ids,
-        meta,
-    })
+    // `cursor`, not `vault_ids.len()`: slots skipped above are already consumed.
+    let meta = storage::page_meta(total, offset, limit, cursor);
+    Ok(crate::types::BeneficiaryVaultPage { vault_ids, meta })
 }

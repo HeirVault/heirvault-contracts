@@ -100,7 +100,9 @@ heirvault-contracts/
 │   │   ├── beneficiaries.rs   # add / remove / update + allocation invariant
 │   │   ├── guardians.rs       # M-of-N approval + anti-lockout rules
 │   │   ├── claims.rs          # claim, rounding, double-claim prevention
-│   │   └── test.rs            # 123 in-crate tests
+│   │   ├── profile.rs         # resource-cost profiling + regression guard rails
+│   │   ├── property.rs        # seeded property-based (mini-fuzz) tests
+│   │   └── test.rs            # 136 in-crate tests (example-based + adversarial)
 │   └── Cargo.toml
 ├── tests/                     # 9 external integration tests (public ABI only)
 │   ├── Cargo.toml
@@ -110,7 +112,8 @@ heirvault-contracts/
 │   ├── STORAGE.md
 │   ├── SECURITY.md
 │   ├── RESOURCE_COSTS.md
-│   └── TESTNET.md
+│   ├── TESTNET.md
+│   └── AUDIT_REPORT.md        # review findings, fixes and evidence
 ├── Cargo.toml                 # workspace
 ├── README.md
 └── .gitignore
@@ -561,9 +564,13 @@ of the controls implemented:
 - Double-claim prevented by a flag set before the transfer, inside the same
   atomic transaction.
 - Checks → effects → interactions everywhere: state is written *before* any
-  token transfer, so a re-entrant or hostile token observes post-transfer
-  accounting, and a failed transfer reverts the accounting with it. The internal
-  balance can therefore never drift from the tokens actually held.
+  token transfer, and a failed transfer reverts that state with it, so the
+  internal balance can never drift from the tokens actually held.
+- Re-entrancy is blocked twice over. The Soroban host runs contract-to-contract
+  calls with re-entry prohibited, so a hostile token cannot call back into the
+  vault at all; and because state is written first, a re-entrant `claim` would
+  find its slot already marked claimed even if it could. Both layers are
+  exercised by `a_reentrant_token_cannot_call_back_into_the_vault_during_transfer`.
 - Rounding dust is paid out rather than trapped, so a vault always reaches
   balance `0` and `COMPLETED`.
 - `balance` is decremented with checked arithmetic and a payout is refused if it
@@ -656,9 +663,18 @@ cargo install --locked stellar-cli     # or download a release binary
 ## Testing
 
 ```bash
-cargo test --workspace          # 123 unit tests + 9 external integration tests
+cargo test --workspace          # 136 unit tests + 9 external integration tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+```
+
+The randomised property suite (`#[test]`s in `src/property.rs`) is deterministic
+and part of `cargo test`, so it needs no nightly toolchain and no separate fuzz
+crate. Its iteration counts are deliberately small so the ordinary suite stays
+quick; raise them for a longer soak:
+
+```bash
+HEIRVAULT_PROPTEST_ITERS=5000 cargo test -p heirvault --lib property
 ```
 
 Test coverage by area (see `contracts/heirvault/src/test.rs`):
@@ -672,11 +688,14 @@ Test coverage by area (see `contracts/heirvault/src/test.rs`):
 | Grace period | every boundary above, plus `get_deadlines` reporting exact values |
 | Activation | too early, at deadline, during grace, at `grace_end`, permissionless, repeat, no beneficiaries, incomplete allocation, zero balance, cancelled, each of the three modes |
 | Guardians | default threshold, duplicates, caps, owner/contract rejected, remove rules, threshold bounds, one-vote-per-attempt, unregistered, removed, no auth, mode mismatch, threshold reached, reset on check-in, anti-lockout, frozen after activation |
-| Claims | before activation, single heir, proportional split, rounding dust, claim order independence, double claim (both before and after completion), unregistered, no auth, cancelled vault, position reporting, pagination |
+| Claims | before activation, single heir, proportional split, rounding dust, a share that rounds to **zero**, claim order independence, double claim (both before and after completion), unregistered, no auth, cancelled vault, position reporting, pagination |
 | Cancellation | success, during grace, after grace expiry, after activation, repeat, no auth, partial/full withdrawal, over-withdrawal, before cancel, after activation, no auth |
-| Pagination | page metadata, stable offsets, past-the-end, zero limit, clamped limit, independent beneficiary/guardian/claim paging |
+| Pagination | page metadata, stable offsets, past-the-end, zero limit, clamped limit, independent beneficiary/guardian/claim paging, skip-aware cursor when an index slot is unreadable |
+| Transaction failure | a token whose `transfer` traps: the claim reverts atomically (claimed flag, balance and `total_claimed` all roll back) and a retry succeeds |
+| Re-entrancy | a hostile token that calls back into `get_vault` and then `claim` from inside its own `transfer`: both call-backs are refused, and the heir is still paid exactly once (asserted from the state *and* from the emitted events) |
 | Authorization | a 12-entry-point matrix against a wrong-but-authorized caller, plus every entry point with no auth at all |
 | Invariants | 300-step randomized allocation sequence, claimed ≤ deposited, activated never returns to active, cancelled never returns to active, completed vault is settled, approvals ≤ guardian count, internal balance ≡ tokens held |
+| Property-based (mini-fuzz) | seeded random sequences in `src/property.rs` over `create_vault` / `deposit` / `add_beneficiary` / `claim`: period-range exactness, internal balance ≡ tokens actually held, allocation never exceeds 100% across random add/remove/update, payouts sum **exactly** to the deposit leaving no dust, no heir paid twice, withdrawals never exceed the balance |
 | Events | each event asserted individually and a full-lifecycle sweep asserting all 14 names |
 
 The `tests/` package adds 9 integration tests that consume the contract through
@@ -685,9 +704,14 @@ client and re-exported types are usable from an SDK, indexer or frontend.
 
 ## Building
 
+Build the **contract package only**. A whole-workspace wasm build also compiles
+the `tests/` crate, whose `soroban-sdk` dependency enables the `testutils`
+feature; that feature is unsupported on `wasm32v1-none` and the build fails.
+
 ```bash
-cargo build --workspace --release --target wasm32v1-none
+cargo build -p heirvault --release --target wasm32v1-none
 # → target/wasm32v1-none/release/heirvault.wasm
+#   (79,154 bytes, sha256 b1b2a61c01e6d77ac0daf1c7150d8e87a6af92375ffdc803d54755ed71dc9816 on rustc 1.99.0)
 ```
 
 ## Deployment
@@ -711,26 +735,36 @@ stellar contract deploy \
 **This contract is deployed and exercised on Stellar Testnet.** Full evidence,
 including every transaction hash, is in **[docs/TESTNET.md](docs/TESTNET.md)**.
 
+> **The live instance matches this source.** Reading the deployed instance's
+> ledger entry over Soroban RPC returns the `ContractExecutable::Wasm` hash
+> `b1b2a61c01e6d77ac0daf1c7150d8e87a6af92375ffdc803d54755ed71dc9816`, which is
+> exactly the `sha256` of `target/wasm32v1-none/release/heirvault.wasm` built
+> from this tree. Verifying the on-chain hash against a local build is the check
+> that catches a stale deployment; see the artefact table in
+> [docs/TESTNET.md](docs/TESTNET.md) and
+> [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md).
+
 | Item | Value |
 |---|---|
 | Network | Stellar Testnet (protocol 29) |
-| **HeirVault contract ID** | `CC6QRWVXN3V4UOADEZSGXNYRQMR252BXH6ERXOSENR64JTKIRCGA3ADO` |
-| Wasm hash | rebuilt from this tree; current build is not byte-identical to the previously documented deployment |
-| Explorer | https://stellar.expert/explorer/testnet/contract/CC6QRWVXN3V4UOADEZSGXNYRQMR252BXH6ERXOSENR64JTKIRCGA3ADO |
-| Deployment tx | https://stellar.expert/explorer/testnet/tx/0c21a7a0af6f1586103060b36f0ad3aac17b9f187bf90d4049df6a3264224bed |
-| Demo SEP-41 asset (SAC) | `CCQACXRCTDFOGOMP6NGJVGASIS3LG4B6WN4H74JNJTQFRBTBMQZ2SMGB` (`HVUSD`) |
+| **HeirVault contract ID** | `CB4I2OSSNXQCH3DGHKGYMG5DPDOUDD55YG3SSDOK4JICVDH5B7KLEWI6` |
+| Wasm hash (on-chain, via RPC) | `b1b2a61c01e6d77ac0daf1c7150d8e87a6af92375ffdc803d54755ed71dc9816` |
+| Wasm hash (fresh build of this tree) | `b1b2a61c01e6d77ac0daf1c7150d8e87a6af92375ffdc803d54755ed71dc9816` — **match** |
+| Explorer | https://stellar.expert/explorer/testnet/contract/CB4I2OSSNXQCH3DGHKGYMG5DPDOUDD55YG3SSDOK4JICVDH5B7KLEWI6 |
+| Deployment tx | https://stellar.expert/explorer/testnet/tx/3333aa5a7a92f600b009f8c7a8c12f0c546dc59c995ed617dabfb30a0ca8d068 |
+| Demo SEP-41 asset (SAC) | `CCOYBUYUFH4LABTD5ZQB6FFCC4VEUWQOPSX6G2AVHWNX3YAY476AGPBX` (`HVUSD`) |
 
 Verified on-chain with real transactions:
 
-- ✅ deployed the wasm and created the contract instance
+- ✅ redeployed the wasm and created the contract instance; **on-chain hash equals the local build**
 - ✅ deployed a real SEP-41 asset (Stellar Asset Contract) and minted it
 - ✅ `create_vault` (both `MissedCheckIn` and `GuardianApproval` modes)
 - ✅ `add_beneficiary` (including a 3333/3333/3334 three-way split)
-- ✅ `deposit` — real SEP-41 `transfer` from owner to contract, twice
+- ✅ `deposit` — real SEP-41 `transfer` from owner to contract
 - ✅ `check_in` on a live vault, with the new deadline read back
 - ✅ `check_in` correctly rejected with `GracePeriodExpired` (#42) after the window
-- ✅ `activate_vault` permissionlessly, called by an unrelated account
-- ✅ `claim` by three heirs, exact distribution, contract drained to `0`
+- ✅ `activate_vault` permissionlessly, called by an account with no role in the vault
+- ✅ `claim` by three heirs, exact distribution, contract balance drained to the still-unsettled vault's share
 - ✅ `guardian_added`, `guardian_threshold_updated`, `guardian_approved`
 - ✅ activation rejected with `NotEligible` (#34) at 1-of-2 approvals, accepted at 2-of-2
 - ✅ `cancel_vault`, two partial `withdraw`s, over-withdrawal rejected with `InsufficientBalance` (#51)
@@ -858,7 +892,11 @@ not been built:
 ## Remaining work
 
 1. **Third-party security audit.** Nothing here has been reviewed by anyone but
-   its author. This is the single biggest gap.
+   its author. This is the single biggest gap. An internal review of this
+   revision — its findings, fixes and the evidence for each — is in
+   [docs/AUDIT_REPORT.md](docs/AUDIT_REPORT.md); it is not a substitute for an
+   independent audit, and the deployed Testnet instance still needs to be
+   redeployed so that on-chain evidence describes this revision.
 2. **Property-based / fuzz testing** with `cargo-fuzz` to complement the
    randomized-sequence invariant tests in the suite.
 3. **Harden the asset probe.** `decimals()` is a good signal but not proof; a

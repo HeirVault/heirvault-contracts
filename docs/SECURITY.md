@@ -117,9 +117,30 @@ they have dedicated tests of the same shape:
 
 ## Re-entrancy
 
-Soroban has no re-entrancy protection primitive, so the discipline has to be
-structural. HeirVault follows **checks → effects → interactions** everywhere a
-token is involved:
+Two independent layers protect a call that moves tokens. Neither is a storage
+cell, and neither is a `require` a reader has to trust — both are tested.
+
+### Layer 1: the host refuses the call-back
+
+Soroban runs contract-to-contract calls with `ContractReentryMode::Prohibited`
+(`soroban-env-host`, the re-entry-distance check in `Host::call_n_internal`,
+reached from `Host::call` / `Host::try_call` via
+`CallParams::default_external_call()`). A contract that is already on the call
+stack therefore **cannot be entered again**: the nested call aborts before any
+of its code runs.
+
+This is executed, not assumed. `a_reentrant_token_cannot_call_back_into_the_vault_during_transfer`
+registers a hostile token that, from inside its own `transfer`, calls back into
+the vault twice: `get_vault` (read-only and unauthenticated, so nothing in
+HeirVault could legitimately refuse it) and `claim` for the heir currently being
+paid. It records each outcome, and both come back refused. The read-only probe is
+what makes the result attributable: the only thing that can reject a call that
+touches no state and needs no authorization is the host rule.
+
+### Layer 2: checks → effects → interactions
+
+HeirVault does not rely on Layer 1 alone. Everywhere a token is involved it
+follows **checks → effects → interactions**:
 
 ```
 1. validate every precondition
@@ -127,20 +148,21 @@ token is involved:
 3. only then call token::transfer
 ```
 
-Consequences:
+So even on a host that permitted re-entry — or if a future revision opted a path
+into the `Allowed` re-entry mode — a re-entrant `claim` would find the heir's
+`claimed` flag already `true` and their payout already deducted, and would be
+rejected with `AlreadyClaimed` rather than paying twice.
 
-- A hostile or buggy token that re-enters observes **post-transfer accounting**.
-  On `claim`, the heir's `claimed` flag is already `true` and their payout is
-  already deducted, so a re-entrant `claim` is rejected with `AlreadyClaimed`.
-- If the transfer fails, the whole transaction reverts — including the state
-  written in step 2. The internal balance cannot drift from the tokens actually
-  held. **This was observed on Testnet**: two claims reverted at the token layer
-  because the heirs lacked a trustline, and the later retries produced exactly
-  the correct distribution, proving the revert left no residue.
+If the transfer fails, the whole transaction reverts — including the state
+written in step 2 — so the internal balance cannot drift from the tokens actually
+held. **This was observed on Testnet**: two claims reverted at the token layer
+because the heirs lacked a trustline, and the later retries produced exactly the
+correct distribution, proving the revert left no residue.
 
-There is no `reentrancy guard` storage cell, and deliberately so: adding one
-would be a second piece of mutable state to keep consistent, and the
-effects-before-interactions ordering already provides the property.
+There is still no `reentrancy guard` storage cell, and deliberately so: adding
+one would be a second piece of mutable state to keep consistent with the record,
+for a guarantee the host already provides and the ordering independently backs
+up.
 
 ---
 

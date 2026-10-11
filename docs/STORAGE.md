@@ -16,10 +16,12 @@ place instead of being scattered across string literals.
 ```rust
 #[contracttype]
 pub enum DataKey {
-    NextVaultId,                 // instance
-    Vault(u64),                  // persistent
-    OwnerVaultCount(Address),    // persistent
-    OwnerVault(Address, u32),    // persistent
+    NextVaultId,                        // instance
+    Vault(u64),                         // persistent
+    OwnerVaultCount(Address),           // persistent
+    OwnerVault(Address, u32),           // persistent
+    BeneficiaryVaultCount(Address),     // persistent
+    BeneficiaryVault(Address, u32),     // persistent
 }
 ```
 
@@ -29,6 +31,13 @@ pub enum DataKey {
 | `Vault(id)` | persistent | every mutator | every entry point touching a vault | the vault record |
 | `OwnerVaultCount(owner)` | persistent | `create_vault` | `get_vaults_by_owner` | size of the owner's list |
 | `OwnerVault(owner, i)` | persistent | `create_vault` | `get_vaults_by_owner` | slot `i` of the list |
+| `BeneficiaryVaultCount(heir)` | persistent | `add_beneficiary` (new slot only) | `get_vaults_by_beneficiary` | size of the heir's vault list |
+| `BeneficiaryVault(heir, i)` | persistent | `add_beneficiary` (new slot only) | `get_vaults_by_beneficiary` | slot `i` of the heir's list |
+
+The two-beneficiary-index keys mirror the owner index for the heir's side of the
+`get_vaults_by_beneficiary` read. They are written **once per new beneficiary
+slot**, not on reactivation of a retained slot, so the hot deposit/claim paths
+never touch them.
 
 There is **no temporary storage**. Every value a vault depends on has to outlive
 a single transaction; a vault whose configuration expired between two calls
@@ -113,9 +122,14 @@ Both the read path (`load_vault`, `load_vault_opt`) and the write path
 > An owner who checks in at least once every ~30 days will never see a vault
 > entry archived, no matter how long the vault lives.
 
-The instance entry is refreshed from every mutating entry point
-(`storage::touch_instance`), so the id counter can never be archived out from
-under the contract.
+The instance entry is refreshed by the vault-lifecycle mutators (`create_vault`,
+`deposit`, `check_in`, `activate_vault`, `cancel_vault`, `withdraw`), each of
+which calls `storage::touch_instance`, so ordinary use keeps the id counter live.
+The pure configuration mutators (`add`/`remove`/`update_beneficiary` and the
+guardian configuration/approval calls) do not refresh it; a configuration-only
+stretch is expected to be preceded or followed by a lifecycle call. Loss of the
+instance entry is not a loss of funds even if it does lapse: Soroban archives
+rather than deletes, and any account can restore the entry.
 
 The window is deliberately below Soroban's maximum TTL. There is a real
 trade-off: a long TTL costs rent, and a too-short one risks a vault being
@@ -189,11 +203,11 @@ Counted from `create_vault`, which is the busiest write path:
 
 | Write | Entries |
 |---|---|
-| allocate vault id | 1 instance |
+| allocate vault id (value + first-time TTL) | 2 instance |
 | save vault record | 1 persistent (+ TTL extend) |
 | append owner slot | 1 persistent (+ TTL extend) |
 | bump owner count | 1 persistent (+ TTL extend) |
-| **total** | **4 ledger entries** |
+| **total** | **5 ledger entries** (matches the measured `create_vault` row in RESOURCE_COSTS.md) |
 
 A mutator (`check_in`, `add_beneficiary`, `claim`, …) is typically:
 

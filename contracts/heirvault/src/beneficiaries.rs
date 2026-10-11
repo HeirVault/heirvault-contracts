@@ -249,7 +249,7 @@ pub fn get_page(
         cursor += 1;
     }
 
-    let meta = storage::page_meta(total, offset, limit, items.len());
+    let meta = storage::page_meta(total, offset, limit, cursor);
     Ok(BeneficiaryPage { items, meta })
 }
 

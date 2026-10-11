@@ -136,28 +136,20 @@ pub fn append_beneficiary_vault(env: &Env, beneficiary: &Address, vault_id: u64)
     let new_count = index
         .checked_add(1)
         .expect("beneficiary vault index must not overflow u32");
-    env.storage()
-        .persistent()
-        .set(&count_key, &new_count);
-    env.storage()
-        .persistent()
-        .extend_ttl(
-            &count_key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND_TO,
-        );
+    env.storage().persistent().set(&count_key, &new_count);
+    env.storage().persistent().extend_ttl(
+        &count_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
 
     let slot_key = DataKey::BeneficiaryVault(beneficiary.clone(), index);
-    env.storage()
-        .persistent()
-        .set(&slot_key, &vault_id);
-    env.storage()
-        .persistent()
-        .extend_ttl(
-            &slot_key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND_TO,
-        );
+    env.storage().persistent().set(&slot_key, &vault_id);
+    env.storage().persistent().extend_ttl(
+        &slot_key,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
 }
 
 /// Number of vaults in which `beneficiary` is or was a beneficiary.
@@ -318,19 +310,29 @@ pub fn clamp_limit(limit: u32) -> Result<u32, HeirVaultError> {
     Ok(limit.min(MAX_PAGE_LIMIT))
 }
 
-/// Build the [`PageMeta`] block for a page that returned `returned` records.
+/// Build the [`PageMeta`] block for a page whose scan stopped at `cursor`.
+///
+/// `cursor` is the index of the first record the *next* page should read, i.e.
+/// the position just past the last slot the scan actually inspected. It is not
+/// always `offset + returned`: a page that skips an unreadable slot
+/// (`get_vaults_by_owner`, `get_vaults_by_beneficiary`) advances the cursor over
+/// that slot without returning a record, and must still hand the caller a
+/// `next_offset` that cannot re-read — or loop forever on — the slots it already
+/// walked past. Deriving `next_offset` from the returned count instead of the
+/// cursor would make a page of skipped entries repeat slots, and a page where
+/// *every* slot is skipped would report `has_more = true` with
+/// `next_offset == offset`, an unbounded loop for a naive client.
 ///
 /// Centralised so every list endpoint reports paging identically: the same
 /// arithmetic drives `has_more` and `next_offset`, which is what lets an SDK
 /// write one paging loop for every collection.
-pub fn page_meta(total: u32, offset: u32, limit: u32, returned: u32) -> PageMeta {
-    let consumed = offset.saturating_add(returned);
-    let has_more = consumed < total;
+pub fn page_meta(total: u32, offset: u32, limit: u32, cursor: u32) -> PageMeta {
+    let has_more = cursor < total;
     PageMeta {
         total,
         offset,
         limit,
         has_more,
-        next_offset: if has_more { Some(consumed) } else { None },
+        next_offset: if has_more { Some(cursor) } else { None },
     }
 }

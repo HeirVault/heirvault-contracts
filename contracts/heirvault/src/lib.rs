@@ -49,6 +49,8 @@ pub mod vault;
 #[cfg(test)]
 mod profile;
 #[cfg(test)]
+mod property;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{contract, contractimpl, contractmeta, Address, Env, Vec};

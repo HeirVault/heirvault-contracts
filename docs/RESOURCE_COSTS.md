@@ -12,6 +12,13 @@ silently regressing.
 cargo test -p heirvault --lib profile_entry_points -- --nocapture
 ```
 
+Re-measure the artifact size with:
+
+```bash
+cargo build -p heirvault --release --target wasm32v1-none
+stat -c%s target/wasm32v1-none/release/heirvault.wasm
+```
+
 The test invokes every entry point once against a realistic fixture and prints a
 table; it also asserts the properties the numbers are supposed to demonstrate, so
 a regression fails the build rather than quietly reporting worse numbers.
@@ -143,8 +150,10 @@ also avoids any write on a partially stale index.
 ### 7. The release profile is tuned for deploy size, not for the meter
 
 `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, symbols
-stripped. The deployed wasm is **76,552 bytes**, and deploy cost is charged per
-byte, so size matters more than a few percent of runtime instructions.
+stripped. The deployed wasm is **79,154 bytes**
+(`sha256 b1b2a61c01e6d77ac0daf1c7150d8e87a6af92375ffdc803d54755ed71dc9816`), and
+deploy cost is charged per byte, so size matters more than a few percent of
+runtime instructions.
 
 `overflow-checks` is deliberately **left enabled**. It costs a handful of
 instructions on paths that already use explicit checked arithmetic, and in
