@@ -1,0 +1,40 @@
+name: Contracts CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Contract Tests & Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.84.0
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy check
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit & Integration tests
+        run: cargo test
+
+      - name: Compile release WASM
+        run: cargo build --package heirvault --target wasm32-unknown-unknown --release
+
+      - name: Verify WASM artifact
+        run: |
+          ls -la target/wasm32-unknown-unknown/release/heirvault.wasm
+          sha256sum target/wasm32-unknown-unknown/release/heirvault.wasm

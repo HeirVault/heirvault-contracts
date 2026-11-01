@@ -668,6 +668,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+> **Windows MinGW note:** On Windows with the GNU toolchain (`x86_64-pc-windows-gnu`), building a host `cdylib` with `soroban-sdk` in debug mode generates over 65,535 exported symbols, exceeding the Windows PE export ordinal limit (`export ordinal too large`). To run tests natively on Windows GNU, run tests targeting `rlib` (`crate-type = ["rlib"]` in `contracts/heirvault/Cargo.toml`) or use the MSVC toolchain (`x86_64-pc-windows-msvc`). WASM builds (`--target wasm32-unknown-unknown`) are not affected.
+
+
 The randomised property suite (`#[test]`s in `src/property.rs`) is deterministic
 and part of `cargo test`, so it needs no nightly toolchain and no separate fuzz
 crate. Its iteration counts are deliberately small so the ordinary suite stays
