@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "end_to_end"
 path = "integration/end_to_end.rs"
 
+[[test]]
+name = "ttl_investigation"
+path = "integration/ttl_investigation.rs"
+
 [dependencies]
 heirvault = { path = "../contracts/heirvault" }
 soroban-sdk = { workspace = true, features = ["testutils"] }

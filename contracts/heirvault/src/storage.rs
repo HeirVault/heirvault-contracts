@@ -154,17 +154,30 @@ pub fn append_beneficiary_vault(env: &Env, beneficiary: &Address, vault_id: u64)
 
 /// Number of vaults in which `beneficiary` is or was a beneficiary.
 pub fn beneficiary_vault_count(env: &Env, beneficiary: &Address) -> u32 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::BeneficiaryVaultCount(beneficiary.clone()))
-        .unwrap_or(0)
+    let key = DataKey::BeneficiaryVaultCount(beneficiary.clone());
+    let count: Option<u32> = env.storage().persistent().get(&key);
+    if count.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    count.unwrap_or(0)
 }
 
 /// Vault id at slot `index` of a beneficiary's vault list, or `None`.
 pub fn beneficiary_vault_id_at(env: &Env, beneficiary: &Address, index: u32) -> Option<u64> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::BeneficiaryVault(beneficiary.clone(), index))
+    let key = DataKey::BeneficiaryVault(beneficiary.clone(), index);
+    let val: Option<u64> = env.storage().persistent().get(&key);
+    if val.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    val
 }
 
 // ---------------------------------------------------------------------------
@@ -252,10 +265,16 @@ pub fn save_vault(env: &Env, vault: &Vault) {
 
 /// Number of vaults recorded against `owner`.
 pub fn owner_vault_count(env: &Env, owner: &Address) -> u32 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::OwnerVaultCount(owner.clone()))
-        .unwrap_or(0)
+    let key = DataKey::OwnerVaultCount(owner.clone());
+    let count: Option<u32> = env.storage().persistent().get(&key);
+    if count.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    count.unwrap_or(0)
 }
 
 /// Append `vault_id` to `owner`'s list.
@@ -288,9 +307,16 @@ pub fn push_owner_vault(env: &Env, owner: &Address, vault_id: u64) -> Result<(),
 
 /// Read one slot of `owner`'s vault list, or `None` past the end.
 pub fn owner_vault_id_at(env: &Env, owner: &Address, index: u32) -> Option<u64> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::OwnerVault(owner.clone(), index))
+    let key = DataKey::OwnerVault(owner.clone(), index);
+    let val: Option<u64> = env.storage().persistent().get(&key);
+    if val.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    val
 }
 
 // ---------------------------------------------------------------------------

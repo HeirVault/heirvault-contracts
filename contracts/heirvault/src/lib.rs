@@ -318,6 +318,7 @@ impl HeirVaultContract {
 
     /// Full vault detail plus deadline, grace end, derived status and readiness.
     pub fn get_vault(env: Env, vault_id: u64) -> Result<VaultInfo, HeirVaultError> {
+        storage::touch_instance(&env);
         vault::get_info(&env, vault_id)
     }
 
